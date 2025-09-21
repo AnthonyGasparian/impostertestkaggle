@@ -110,7 +110,7 @@ class PairDataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         train_df, val_df = train_test_split(
             self.df,
-            test_size=0.1,
+            test_size=0.2,
             random_state=SEED,
             stratify=self.df["target"],
         )
@@ -187,13 +187,13 @@ class BertPairMLP(pl.LightningModule):
 
         feat_dim = hs * 2
         self.mlp = nn.Sequential(
-            nn.Linear(feat_dim, 512),
+            nn.Linear(feat_dim, 64),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(512, 128),
+            nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(128, 1),
+            nn.Linear(32, 1),
         )
 
         self.criterion = nn.BCEWithLogitsLoss()
@@ -427,6 +427,7 @@ def main():
     print("Test predictions head:")
     print(submission.head())
     submission.to_csv("test_predictions.csv", index=False)
+    submission.to_csv("submission/test_predictions.csv.gz", index=False)
     print("Saved test predictions to test_predictions.csv")
 
 
