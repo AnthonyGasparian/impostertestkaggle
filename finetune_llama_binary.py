@@ -117,3 +117,132 @@ def binary_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor, thres
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
     return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
+
+
+# ---------------------------
+# Training loop
+# ---------------------------
+def train(
+    model: nn.Module,
+    tokenizer,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    output_dir: str,
+    gradient_accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    warmup_steps: int = 0,
+    use_fp16: bool = True,
+):
+    model.to(device)
+
+    # Only parameters with requires_grad=True will be optimized
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+
+    total_steps = (len(train_loader) // gradient_accumulation_steps) * epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=max(1, total_steps))
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16 and device.type == "cuda")
+
+    global_step = 0
+    best_val_f1 = -1.0
+
+    for epoch in range(epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Train Epoch {epoch+1}")
+        running_loss = 0.0
+
+        for step, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.cuda.amp.autocast(enabled=use_fp16 and device.type == "cuda"):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs["loss"] / gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+            running_loss += loss.item() * gradient_accumulation_steps
+
+            if (step + 1) % gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
+
+                pbar.set_postfix({"loss": f"{running_loss / (global_step + 1):.4f}"})
+
+        # End epoch: evaluate
+        val_metrics = evaluate(model, val_loader, device, use_fp16=use_fp16)
+        val_f1 = val_metrics["f1"]
+        print(f"Epoch {epoch+1} validation metrics: {val_metrics}")
+
+        # Save best
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            os.makedirs(output_dir, exist_ok=True)
+            save_path = os.path.join(output_dir, "best_model.pth")
+            # Save model state dict + tokenizer
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "tokenizer": tokenizer.__class__.__name__,
+                "config": getattr(model, "config", None)
+            }, save_path)
+            # also save via huggingface methods if base supports it
+            try:
+                # if base model is HF-like, save with save_pretrained for tokenizer compatibility
+                tokenizer.save_pretrained(output_dir)
+                # attempt to save base model weights (only works if the underlying HF objects have save_pretrained)
+                if hasattr(model.base, "save_pretrained"):
+                    model.base.save_pretrained(os.path.join(output_dir, "base_model"))
+            except Exception as e:
+                print("Warning: couldn't save tokenizer/base via HF utilities:", e)
+
+    print("Training complete. Best val f1:", best_val_f1)
+    return model
+
+# ---------------------------
+# Evaluation
+# ---------------------------
+@torch.no_grad()
+def evaluate(model: nn.Module, data_loader: DataLoader, device: torch.device, use_fp16: bool = True):
+    model.eval()
+    all_logits = []
+    all_labels = []
+    for batch in tqdm(data_loader, desc="Evaluating", leave=False):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        with torch.cuda.amp.autocast(enabled=use_fp16 and device.type == "cuda"):
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out["logits"]
+
+        all_logits.append(logits.cpu())
+        all_labels.append(labels.cpu())
+
+    all_logits = torch.cat(all_logits, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    metrics = binary_metrics_from_logits(all_logits, all_labels)
+    return metrics
+
+# ---------------------------
+# Utility to load CSVs and build dataloaders
+# ---------------------------
+def build_dataloaders(train_csv: str, val_csv: str, tokenizer, batch_size: int, max_length: int, num_workers: int = 0):
+    train_df = pd.read_csv(train_csv)
+    val_df = pd.read_csv(val_csv)
+
+    assert "text" in train_df.columns and "label" in train_df.columns, "CSV must have 'text' and 'label' columns."
+
+    train_ds = TextLabelDataset(train_df["text"].tolist(), train_df["label"].tolist(), tokenizer, max_length=max_length)
+    val_ds = TextLabelDataset(val_df["text"].tolist(), val_df["label"].tolist(), tokenizer, max_length=max_length)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    return train_loader, val_loader
