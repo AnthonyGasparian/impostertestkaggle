@@ -246,3 +246,50 @@ def build_dataloaders(train_csv: str, val_csv: str, tokenizer, batch_size: int, 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     return train_loader, val_loader
+
+# ---------------------------
+# Main CLI
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_dir", type=str, required=True, help="Local path to base model (HuggingFace format) or HF repo id.")
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--val_csv", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--freeze_base", type=lambda x: x.lower() == "true", default=True,
+                        help="If True, freeze base model and only train classifier head.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--use_fp16", type=lambda x: x.lower() == "true", default=True)
+    parser.add_argument("--num_workers", type=int, default=0)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # Tokenizer: load from model_dir if available
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True, trust_remote_code=False)
+
+    train_loader, val_loader = build_dataloaders(args.train_csv, args.val_csv, tokenizer, args.batch_size, args.max_length, num_workers=args.num_workers)
+
+    model = LMForBinaryClassification(args.model_dir, freeze_base=args.freeze_base)
+
+    # If fine-tuning base (unfrozen) on large model, consider use of LoRA/PEFT instead of full fine-tune to save memory.
+    trained_model = train(
+        model,
+        tokenizer,
+        train_loader,
+        val_loader,
+        device,
+        epochs=args.epochs,
+        lr=args.lr,
+        output_dir=args.out_dir,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        use_fp16=args.use_fp16
+    )
+
+if __name__ == "__main__":
+    main()
