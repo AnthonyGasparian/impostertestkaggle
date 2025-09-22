@@ -98,3 +98,22 @@ class LMForBinaryClassification(nn.Module):
             loss = loss_fct(logits, labels.float())
             out["loss"] = loss
         return out
+
+
+# ---------------------------
+# Helpers: metrics
+# ---------------------------
+def binary_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor, threshold: float = 0.5):
+    probs = torch.sigmoid(logits)
+    preds = (probs >= threshold).long()
+    labels_long = labels.long()
+    correct = (preds == labels_long).sum().item()
+    acc = correct / labels.size(0)
+    # simple precision/recall/f1
+    tp = ((preds == 1) & (labels_long == 1)).sum().item()
+    fp = ((preds == 1) & (labels_long == 0)).sum().item()
+    fn = ((preds == 0) & (labels_long == 1)).sum().item()
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
